@@ -1,0 +1,526 @@
+# ==============================================
+# LAUNCHLAB - QUICK HOMELAB DEPLOYMENT
+# ==============================================
+# All services pre-configured with default admin accounts
+# Username: admin | Password: changeme
+# Change passwords after first login!
+# ==============================================
+
+# Global logging configuration
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+# ==============================================
+# NETWORKS
+# ==============================================
+
+networks:
+  homelab-net:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: ${DOCKER_SUBNET:-172.20.0.0/16}
+          gateway: ${DOCKER_GATEWAY:-172.20.0.1}
+
+# ==============================================
+# SERVICES
+# ==============================================
+
+services:
+
+  # ============================================
+  # FOUNDATION - Container Management
+  # ============================================
+
+  portainer:
+    image: portainer/portainer-ce:2.21.4
+    container_name: portainer
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./data/portainer:/data
+    ports:
+      - "9000:9000" # Web UI
+      - "9443:9443" # HTTPS UI
+    networks:
+      homelab-net:
+        ipv4_address: 172.20.0.10
+    logging: *default-logging
+    # Healthcheck disabled - portainer image doesn't include shell or health check tools
+    # Container is considered healthy when it's running and listening on port 9000
+
+  # ============================================
+  # NETWORK LAYER - DNS & VPN
+  # ============================================
+
+  # Nginx - Reverse Proxy
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: nginx
+    restart: unless-stopped
+    volumes:
+      - ./config/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "80:80" # HTTP reverse proxy for all services
+    networks:
+      homelab-net:
+        ipv4_address: 172.20.0.2
+    depends_on:
+      - jellyfin
+      - immich-server
+      - paperless-ngx
+      - portainer
+      - element-web
+      - matrix-synapse
+      - pihole
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD", "nginx", "-t"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # DuckDNS - Dynamic DNS Updater
+  duckdns:
+    image: lscr.io/linuxserver/duckdns:latest
+    container_name: duckdns
+    restart: unless-stopped
+    profiles: ["wireguard"]
+    environment:
+      PUID: 1000
+      PGID: 1000
+      TZ: ${TIMEZONE}
+      SUBDOMAINS: ${DUCKDNS_DOMAIN}
+      TOKEN: ${DUCKDNS_TOKEN}
+      LOG_FILE: false
+    networks:
+      - homelab-net
+    logging: *default-logging
+
+  # Pi-hole - DNS + Ad Blocking
+  pihole:
+    image: pihole/pihole:2024.07.0
+    container_name: pihole
+    hostname: pihole
+    restart: unless-stopped
+    environment:
+      TZ: ${TIMEZONE}
+      WEBPASSWORD: ${PIHOLE_PASSWORD}
+      FTLCONF_LOCAL_IPV4: 172.20.0.4
+      PIHOLE_DNS_: 1.1.1.1;1.0.0.1 # Cloudflare upstream
+      DNSMASQ_LISTENING: all
+      WEB_PORT: 80
+      WEBTHEME: default-dark
+    volumes:
+      - ./data/pihole/config:/etc/pihole
+      - ./data/pihole/dnsmasq:/etc/dnsmasq.d
+      - ./config/pihole/custom.list:/etc/pihole/custom.list:ro
+      - ./config/pihole/02-homelab.conf:/etc/dnsmasq.d/02-homelab.conf:ro
+    ports:
+      - "53:53/tcp"
+      - "53:53/udp"
+      - "8053:80/tcp" # Web interface
+    networks:
+      homelab-net:
+        ipv4_address: 172.20.0.4
+    cap_add:
+      - NET_ADMIN
+    logging: *default-logging
+    healthcheck:
+      test: [ "CMD", "dig", "+short", "@127.0.0.1", "pi.hole" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # WireGuard VPN (wg-easy)
+  wg-easy:
+    image: ghcr.io/wg-easy/wg-easy:14
+    container_name: wg-easy
+    hostname: wg-easy
+    restart: unless-stopped
+    profiles: ["wireguard"]
+    environment:
+      LANG: en
+      WG_HOST: ${DOMAIN}
+      PASSWORD_HASH: "${WG_PASSWORD_HASH}"
+      PORT: 51821
+      WG_PORT: 51820
+      WG_DEFAULT_ADDRESS: 10.8.0.x
+      WG_DEFAULT_DNS: 172.20.0.4 # Pi-hole
+      WG_ALLOWED_IPS: 10.8.0.0/24, 172.20.0.0/16, ${LOCAL_SUBNET}
+      WG_PERSISTENT_KEEPALIVE: 25
+      WG_MTU: 1420
+    volumes:
+      - ./data/wg-easy:/etc/wireguard
+    ports:
+      - "51820:51820/udp" # WireGuard VPN
+      - "51821:51821/tcp" # wg-easy web UI
+    networks:
+      homelab-net:
+        ipv4_address: 172.20.0.5
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    sysctls:
+      - net.ipv4.conf.all.src_valid_mark=1
+      - net.ipv4.ip_forward=1
+    logging: *default-logging
+    # Healthcheck disabled - wg-easy image doesn't include shell or health check tools
+    # Container is considered healthy when it's running and listening on port 51821
+
+  # Tailscale VPN - Zero-config mesh network (alternative to WireGuard)
+  tailscale:
+    image: tailscale/tailscale:latest
+    container_name: tailscale
+    hostname: ${TAILSCALE_HOSTNAME:-launchlab}
+    restart: unless-stopped
+    profiles: ["tailscale"]
+    environment:
+      TS_AUTHKEY: ${TAILSCALE_AUTHKEY}
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_USERSPACE: false
+      # Advertise Docker subnet to Tailscale network
+      TS_EXTRA_ARGS: --advertise-routes=${DOCKER_SUBNET:-172.20.0.0/16} --accept-routes
+    volumes:
+      - ./data/tailscale:/var/lib/tailscale
+      - /dev/net/tun:/dev/net/tun
+    networks:
+      homelab-net:
+        ipv4_address: 172.20.0.5  # Same IP as wg-easy (won't conflict due to profiles)
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    sysctls:
+      - net.ipv4.conf.all.src_valid_mark=1
+      - net.ipv4.ip_forward=1
+      - net.ipv6.conf.all.forwarding=1
+    logging: *default-logging
+
+  # Tailscale automation init container
+  tailscale-init:
+    image: python:3.11-alpine
+    container_name: tailscale-init
+    restart: "no"  # Run once only
+    profiles: ["tailscale"]
+    environment:
+      TAILSCALE_API_TOKEN: ${TAILSCALE_API_TOKEN:-}
+      TAILSCALE_TAILNET: ${TAILSCALE_TAILNET:-}
+      TAILSCALE_HOSTNAME: ${TAILSCALE_HOSTNAME:-launchlab}
+      DOCKER_SUBNET: ${DOCKER_SUBNET:-172.20.0.0/16}
+      PIHOLE_IP: 172.20.0.4  # Pi-hole's Docker subnet IP for DNS
+    volumes:
+      - ./scripts/init-tailscale.py:/init.py:ro
+    command: sh -c "if [ -n \"$$TAILSCALE_API_TOKEN\" ]; then python /init.py; else echo 'Skipping Tailscale automation (no API token)'; fi"
+    networks:
+      - homelab-net
+    depends_on:
+      tailscale:
+        condition: service_started
+    logging: *default-logging
+
+  # ============================================
+  # STORAGE & DATABASES
+  # ============================================
+
+  # Init Container - Database Setup
+  launchlab-init:
+    image: postgres:16-alpine
+    container_name: launchlab-init
+    restart: "no" # Run once only
+    volumes:
+      - ./scripts/docker-init.sh:/init.sh:ro
+      - ./data/matrix/synapse:/matrix-data
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      MATRIX_SERVER_NAME: ${MATRIX_SERVER_NAME}
+    command: sh /init.sh
+    networks:
+      - homelab-net
+    depends_on:
+      postgres:
+        condition: service_healthy
+    logging: *default-logging
+
+  # PostgreSQL - Shared Database
+  postgres:
+    image: tensorchord/pgvecto-rs:pg16-v0.2.0
+    container_name: postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: postgres
+      POSTGRES_MULTIPLE_DATABASES: immich,matrix,paperless
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+      - ./config/postgres/init-multi-db.sh:/docker-entrypoint-initdb.d/init-multi-db.sh:ro
+      - ./config/postgres/seed-admins.sql:/docker-entrypoint-initdb.d/seed-admins.sql:ro
+    networks:
+      homelab-net:
+        ipv4_address: 172.20.0.6
+    logging: *default-logging
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER}" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis - Shared Cache
+  redis:
+    image: redis:7.4-alpine
+    container_name: redis
+    restart: unless-stopped
+    command: redis-server --requirepass ${REDIS_PASSWORD} --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - ./data/redis:/data
+    networks:
+      homelab-net:
+        ipv4_address: 172.20.0.7
+    logging: *default-logging
+    healthcheck:
+      test: [ "CMD", "redis-cli", "--raw", "incr", "ping" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ============================================
+  # MEDIA & PHOTOS
+  # ============================================
+
+  # Immich Server - Photo Management
+  immich-server:
+    image: ghcr.io/immich-app/immich-server:v1.117.0
+    container_name: immich-server
+    restart: unless-stopped
+    environment:
+      DB_HOSTNAME: postgres
+      DB_USERNAME: ${POSTGRES_USER}
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      DB_DATABASE_NAME: immich
+      REDIS_HOSTNAME: redis
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      IMMICH_MACHINE_LEARNING_URL: http://immich-ml:3003
+    volumes:
+      - ./data/immich/upload:/usr/src/app/upload
+      - /etc/localtime:/etc/localtime:ro
+    ports:
+      - "2283:3001" # Immich API + Web UI
+    networks:
+      homelab-net:
+        ipv4_address: 172.20.0.20
+    depends_on:
+      launchlab-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_started
+      redis:
+        condition: service_started
+    logging: *default-logging
+    # Healthcheck disabled - immich image doesn't include curl/wget
+    # healthcheck:
+    #   test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3001/api/server-info/ping || exit 1"]
+    #   interval: 30s
+    #   timeout: 10s
+    #   retries: 3
+    #   start_period: 60s
+
+    # Immich Machine Learning
+  immich-ml:
+    image: ghcr.io/immich-app/immich-machine-learning:v1.117.0
+    container_name: immich-ml
+    restart: unless-stopped
+    volumes:
+      - ./data/immich/model-cache:/cache
+    networks:
+      homelab-net:
+        ipv4_address: 172.20.0.22
+    logging: *default-logging
+
+  # Jellyfin - Media Streaming
+  jellyfin:
+    image: jellyfin/jellyfin:10.9.11
+    container_name: jellyfin
+    restart: unless-stopped
+    environment:
+      JELLYFIN_PublishedServerUrl: http://media.homelab.local:8096
+    volumes:
+      - ./data/jellyfin/config:/config
+      - ./data/jellyfin/cache:/cache
+      # Media libraries (user adds their own paths)
+      # - /path/to/movies:/media/movies:ro
+      # - /path/to/tvshows:/media/tvshows:ro
+      # - /path/to/photos:/media/photos:ro
+    ports:
+      - "8096:8096" # HTTP web interface
+      - "8920:8920" # HTTPS (optional)
+      - "7359:7359/udp" # Service discovery
+      - "1900:1900/udp" # DLNA
+    networks:
+      homelab-net:
+        ipv4_address: 172.20.0.21
+    # Uncomment for hardware acceleration
+    # devices:
+    #   - /dev/dri:/dev/dri  # Intel/AMD GPU
+    logging: *default-logging
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8096/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # ============================================
+  # COMMUNICATION - Matrix Chat
+  # ============================================
+
+  # Matrix Synapse - Chat Server
+  matrix-synapse:
+    image: matrixdotorg/synapse:v1.115.0
+    container_name: matrix-synapse
+    hostname: matrix
+    restart: unless-stopped
+    environment:
+      SYNAPSE_SERVER_NAME: ${MATRIX_SERVER_NAME}
+      SYNAPSE_REPORT_STATS: "no"
+      SYNAPSE_NO_TLS: "true"
+      POSTGRES_HOST: postgres
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: matrix
+    volumes:
+      - ./data/matrix/synapse:/data
+    ports:
+      - "8008:8008" # HTTP API + Federation
+    networks:
+      homelab-net:
+        ipv4_address: 172.20.0.30
+    depends_on:
+      launchlab-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_started
+    logging: *default-logging
+    healthcheck:
+      test: [ "CMD-SHELL", "curl -f http://localhost:8008/health || exit 1" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # Element Web - Matrix Client
+  element-web:
+    image: vectorim/element-web:v1.11.81
+    container_name: element-web
+    restart: unless-stopped
+    volumes:
+      - ./config/element/config.json:/app/config.json:ro
+    ports:
+      - "8081:80" # Web interface
+    networks:
+      homelab-net:
+        ipv4_address: 172.20.0.31
+    depends_on:
+      - matrix-synapse
+    logging: *default-logging
+
+  # ============================================
+  # UTILITIES - Document Management
+  # ============================================
+
+  # Paperless-Redis - Task Queue
+  paperless-redis:
+    image: redis:7.4-alpine
+    container_name: paperless-redis
+    restart: unless-stopped
+    command: redis-server --save 60 1 --loglevel warning
+    volumes:
+      - ./data/paperless-redis:/data
+    networks:
+      homelab-net:
+        ipv4_address: 172.20.0.51
+    logging: *default-logging
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Paperless-ngx - Document Management
+  paperless-ngx:
+    image: ghcr.io/paperless-ngx/paperless-ngx:2.12.1
+    container_name: paperless-ngx
+    hostname: paperless
+    restart: unless-stopped
+    environment:
+      PAPERLESS_REDIS: redis://paperless-redis:6379
+      PAPERLESS_DBHOST: postgres
+      PAPERLESS_DBNAME: paperless
+      PAPERLESS_DBUSER: ${POSTGRES_USER}
+      PAPERLESS_DBPASS: ${POSTGRES_PASSWORD}
+      PAPERLESS_SECRET_KEY: ${PAPERLESS_SECRET_KEY}
+      PAPERLESS_URL: http://docs.homelab.local:8000
+      PAPERLESS_TIME_ZONE: ${TIMEZONE}
+      PAPERLESS_OCR_LANGUAGE: eng
+      PAPERLESS_ADMIN_USER: ${PAPERLESS_ADMIN_USER}
+      PAPERLESS_ADMIN_PASSWORD: ${PAPERLESS_ADMIN_PASSWORD}
+      PAPERLESS_ADMIN_MAIL: ${PAPERLESS_ADMIN_EMAIL}
+      PAPERLESS_OCR_USER_ARGS: '{"invalidate_digital_signatures": true}'
+      PAPERLESS_CONSUMER_POLLING: 60
+      PAPERLESS_CONSUMER_RECURSIVE: true
+      PAPERLESS_CONSUMER_SUBDIRS_AS_TAGS: true
+      PAPERLESS_FILENAME_FORMAT: '{created_year}/{correspondent}/{title}'
+      PAPERLESS_ENABLE_UPDATE_CHECK: false
+    volumes:
+      - ./data/paperless/data:/usr/src/paperless/data
+      - ./data/paperless/media:/usr/src/paperless/media
+      - ./data/paperless/export:/usr/src/paperless/export
+      - ./data/paperless/consume:/usr/src/paperless/consume
+    ports:
+      - "8000:8000" # Web UI
+    networks:
+      homelab-net:
+        ipv4_address: 172.20.0.50
+    depends_on:
+      launchlab-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_started
+      paperless-redis:
+        condition: service_started
+    logging: *default-logging
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8000" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+# ==============================================
+# NOTES
+# ==============================================
+
+# To deploy this stack:
+#   1. Run: bash scripts/quicksetup.sh
+#   2. Run: docker compose up -d
+#   3. Access services at http://localhost:[PORT]
+#
+# Default credentials (all services):
+#   Username: admin
+#   Password: changeme
+#
+# To update services:
+#   docker compose pull
+#   docker compose up -d
+#
+# To view logs:
+#   docker compose logs [service]
+#
+# For detailed instructions, see README.md

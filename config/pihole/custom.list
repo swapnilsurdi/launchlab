@@ -1,0 +1,44 @@
+# Pi-hole Custom DNS Entries
+# Maps .ll domains to Nginx reverse proxy
+# Nginx (172.20.0.2) routes requests to appropriate services on port 80
+# These domains are accessible via VPN (WireGuard or Tailscale)
+
+# ALL SERVICES ROUTE THROUGH NGINX REVERSE PROXY
+# This allows clean URLs without port numbers (e.g., http://media.ll)
+
+# Container Management
+172.20.0.2 portainer.ll
+
+# Photo Management (Immich)
+172.20.0.2 immich.ll
+172.20.0.2 photos.ll
+
+# Media Streaming (Jellyfin)
+172.20.0.2 jellyfin.ll
+172.20.0.2 media.ll
+
+# Document Management (Paperless)
+172.20.0.2 paperless.ll
+172.20.0.2 docs.ll
+
+# Matrix Chat Server
+172.20.0.2 matrix.ll
+172.20.0.2 chat.ll
+
+# Element Web (Matrix Client)
+172.20.0.2 element.ll
+
+# Pi-hole DNS
+172.20.0.2 pihole.ll
+172.20.0.2 dns.ll
+
+# WireGuard VPN Management (only if using WireGuard)
+172.20.0.2 vpn.ll
+172.20.0.2 wg-easy.ll
+172.20.0.2 wireguard.ll
+
+# How it works:
+# 1. Browser requests http://media.ll
+# 2. DNS resolves to 172.20.0.2 (Nginx)
+# 3. Nginx checks server_name and proxies to http://172.20.0.21:8096 (Jellyfin)
+# 4. User sees Jellyfin without typing port numbers!

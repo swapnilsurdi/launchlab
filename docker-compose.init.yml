@@ -1,0 +1,112 @@
+# ==============================================
+# INIT CONTAINERS FOR LAUNCHLAB
+# ==============================================
+# Optional: Add these init containers to automatically
+# create admin users with default credentials
+#
+# Usage: Merge with main docker-compose.yml
+# ==============================================
+
+version: '3.8'
+
+services:
+
+  # ============================================
+  # INIT CONTAINERS - Admin User Creation
+  # ============================================
+
+  # Portainer Init - Create admin user
+  portainer-init:
+    image: python:3.9-alpine
+    container_name: portainer-init
+    volumes:
+      - ./scripts/init-portainer.py:/init.py:ro
+    environment:
+      PORTAINER_URL: http://portainer:9000
+      ADMIN_USER: admin
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-changeme12345}
+      PYTHONUNBUFFERED: 1
+    command: python3 /init.py
+    networks:
+      - homelab-net
+    depends_on:
+      portainer:
+        condition: service_started
+    restart: "no"  # Run once only
+
+  # Immich Init - Create admin user
+  immich-init:
+    image: python:3.9-alpine
+    container_name: immich-init
+    volumes:
+      - ./scripts/init-immich.py:/init.py:ro
+    environment:
+      IMMICH_URL: http://immich-server:3001
+      ADMIN_EMAIL: ${EMAIL:-admin@homelab.local}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-changeme12345}
+      PYTHONUNBUFFERED: 1
+    command: python3 /init.py
+    networks:
+      - homelab-net
+    depends_on:
+      immich-server:
+        condition: service_healthy
+    restart: "no"
+
+  # Jellyfin Init - Create admin user
+  jellyfin-init:
+    image: python:3.9-alpine
+    container_name: jellyfin-init
+    volumes:
+      - ./scripts/init-jellyfin.py:/init.py:ro
+    environment:
+      JELLYFIN_URL: http://jellyfin:8096
+      ADMIN_USER: admin
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-changeme12345}
+      PYTHONUNBUFFERED: 1
+    command: python3 /init.py
+    networks:
+      - homelab-net
+    depends_on:
+      jellyfin:
+        condition: service_healthy
+    restart: "no"
+
+  # Matrix Init - Create admin user
+  matrix-init:
+    image: matrixdotorg/synapse:v1.115.0
+    container_name: matrix-init
+    entrypoint: []
+    volumes:
+      - ./data/matrix/synapse:/data
+      - ./scripts/init-matrix.sh:/init.sh:ro
+    environment:
+      ADMIN_USER: admin
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-changeme12345}
+      MATRIX_URL: http://matrix-synapse:8008
+    command: ["sh", "/init.sh"]
+    networks:
+      - homelab-net
+    depends_on:
+      matrix-synapse:
+        condition: service_healthy
+    restart: "no"
+
+# ==============================================
+# USAGE NOTES
+# ==============================================
+
+# To use init containers:
+#
+# 1. Merge with main docker-compose.yml:
+#    docker compose -f docker-compose.yml -f docker-compose.init.yml up -d
+#
+# 2. Or copy these service definitions into main docker-compose.yml
+#
+# 3. Init containers will run once and exit after creating admin users
+#
+# 4. All services will have default credentials:
+#    Username: admin (or email from .env for Immich)
+#    Password: Set by ADMIN_PASSWORD in .env (default: changeme12345)
+#
+# 5. IMPORTANT: Change ADMIN_PASSWORD in .env after first login!
